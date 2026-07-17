@@ -1,0 +1,306 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (debug, release)'
+        required: true
+        default: 'debug'
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.0'
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: unit-test-results
+          path: |
+            **/build/test-results/**/*.xml
+            **/build/reports/tests/**
+
+      - name: Publish test results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: '**/build/test-results/**/*.xml'
+          check_name: Unit Test Results
+
+  lint:
+    name: Code Quality & Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+
+      - name: Run Lint checks
+        run: ./gradlew lint --stacktrace
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: lint-results
+          path: '**/build/reports/lint-results*'
+
+  build-debug:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  build-release:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_FILE }}" | base64 --decode > keystore.jks
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --stacktrace
+        env:
+          KEYSTORE_PATH: keystore.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Sign APK
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.KEYSTORE_FILE }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/app-release-signed.apk
+          retention-days: 30
+
+  firebase-distribution:
+    name: Firebase App Distribution
+    runs-on: ubuntu-latest
+    needs: build-release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download release APK
+        uses: actions/download-artifact@v3
+        with:
+          name: release-apk
+
+      - name: Upload to Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_CREDENTIALS }}
+          file: app-release-signed.apk
+          groups: testers
+          releaseNotes: ${{ github.event.head_commit.message }}
+
+  build-logs:
+    name: Archive Build Logs
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [build-debug, build-release]
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create build summary
+        run: |
+          mkdir -p build-summary
+          echo "# Build Summary" > build-summary/summary.md
+          echo "" >> build-summary/summary.md
+          echo "**Build Date:** $(date)" >> build-summary/summary.md
+          echo "**Commit:** ${{ github.sha }}" >> build-summary/summary.md
+          echo "**Branch:** ${{ github.ref }}" >> build-summary/summary.md
+          echo "**Trigger:** ${{ github.event_name }}" >> build-summary/summary.md
+
+      - name: Upload build summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-summary
+          path: build-summary/
+
+  notify-slack:
+    name: Slack Notification
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [test, lint, build-debug, build-release]
+
+    steps:
+      - name: Determine build status
+        id: status
+        run: |
+          if [ "${{ needs.test.result }}" == "failure" ] || [ "${{ needs.lint.result }}" == "failure" ]; then
+            echo "status=❌ FAILED" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.build-debug.result }}" == "failure" ] || [ "${{ needs.build-release.result }}" == "failure" ]; then
+            echo "status=⚠️ BUILD FAILED" >> $GITHUB_OUTPUT
+            echo "color=warning" >> $GITHUB_OUTPUT
+          else
+            echo "status=✅ SUCCESS" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "title": "Sur-AI-Music Build ${{ steps.status.outputs.status }}",
+                  "title_link": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                  "fields": [
+                    {
+                      "title": "Commit",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                    },
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}"
+                    },
+                    {
+                      "title": "Author",
+                      "value": "${{ github.actor }}"
+                    },
+                    {
+                      "title": "Message",
+                      "value": "${{ github.event.head_commit.message }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download release APK
+        uses: actions/download-artifact@v3
+        with:
+          name: release-apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app-release-signed.apk
+          body: |
+            ## Sur-AI-Music Release
+            
+            **Version:** ${{ github.ref_name }}
+            **Commit:** ${{ github.sha }}
+            
+            ### Changes
+            - Automated build from GitHub Actions
+            
+            ### Download
+            - APK: `app-release-signed.apk`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
